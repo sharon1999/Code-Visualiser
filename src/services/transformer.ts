@@ -2,21 +2,23 @@
  * Transformer Service
  *
  * Takes raw JavaScript / TypeScript source code, parses it into a Babel AST,
- * walks the tree with @babel/traverse, and injects `__capture(step)` calls
- * after every targeted statement.  The instrumented AST is then serialised
- * back to JavaScript by @babel/generator, which also produces a v3 source map.
+ * walks the tree with @babel/traverse, and injects instrumentation calls that
+ * power the Phase 5 snapshot recorder.
+ *
+ * Injected runtime hooks (all provided by the executor worker):
+ *
+ *   __capture(step)            – fires at every tracked statement; triggers a
+ *                                 snapshot post to the main thread.
+ *   __trackVar(name, value)    – records the current value of a variable so the
+ *                                 snapshot can include up-to-date variable state.
+ *   __enterScope(fnName, line) – pushed when entering a function body; updates
+ *                                 call-stack tracking.
+ *   __exitScope()              – popped on every return / function end.
+ *   __enterLoop()              – increments the loop-depth counter.
+ *   __exitLoop()               – decrements the loop-depth counter.
  *
  * Public surface:
  *   transformCode(code, options?) → TransformResult
- *
- * Architecture notes:
- *   - The visitor pipeline is composed from small, single-responsibility plugin
- *     functions (see VISITOR PLUGINS section).  Adding a new capture site means
- *     writing one more plugin and registering it in `buildVisitor`.
- *   - All state (step counter, capture-point list) is held in a `TransformContext`
- *     object that is threaded through every plugin – no module-level singletons.
- *   - The service never mutates the original AST; `parseCode` clones nothing, but
- *     traverse edits happen on a fresh parse each call.
  */
 
 import traverse, { type NodePath, type Visitor } from "@babel/traverse";
@@ -32,18 +34,10 @@ import type {
 
 // ─── Internal context ──────────────────────────────────────────────────────────
 
-/**
- * Mutable context shared across all visitor plugins within a single
- * `transformCode` call.
- */
 interface TransformContext {
-  /** Monotonically increasing step counter (starts at 1). */
   step: number;
-  /** Accumulates one entry per injected `__capture` call. */
   capturePoints: CapturePoint[];
-  /** Resolved capture-function identifier name (default: `"__capture"`). */
   captureFnName: string;
-  /** Merged, fully-resolved options (all flags boolean). */
   opts: Required<Omit<TransformOptions, "captureFunctionName">>;
 }
 
@@ -60,14 +54,11 @@ const DEFAULT_OPTIONS: Required<TransformOptions> = {
   captureFunctionName: "__capture",
 };
 
-// ─── AST helpers ──────────────────────────────────────────────────────────────
+// ─── AST node builders ────────────────────────────────────────────────────────
 
 /**
- * Builds the AST node for `__capture(step)` and records the capture point.
- *
- * @param ctx      - Shared transform context (mutated: step incremented).
- * @param nodeType - The originating AST node type string.
- * @param loc      - Optional source location from the triggering node.
+ * Builds `__capture(step)` and records the capture point.
+ * The step counter is incremented after recording.
  */
 function buildCaptureCall(
   ctx: TransformContext,
@@ -75,64 +66,117 @@ function buildCaptureCall(
   loc?: t.SourceLocation | null,
 ): t.ExpressionStatement {
   const step = ctx.step++;
-
   ctx.capturePoints.push({
     step,
     nodeType,
     line: loc?.start.line ?? null,
     column: loc?.start.column ?? null,
   });
-
   return t.expressionStatement(
     t.callExpression(t.identifier(ctx.captureFnName), [t.numericLiteral(step)]),
   );
 }
 
 /**
- * Inserts a `__capture` statement immediately *after* `path` in its parent
- * block, falling back to wrapping in a block if the parent is a bare
- * single-statement branch (e.g. `if (x) stmt`).
+ * Builds `__trackVar("name", name)` — a variable snapshot hook.
+ */
+function buildTrackVarCall(name: string): t.ExpressionStatement {
+  return t.expressionStatement(
+    t.callExpression(t.identifier("__trackVar"), [
+      t.stringLiteral(name),
+      t.identifier(name),
+    ]),
+  );
+}
+
+/**
+ * Builds `__enterScope("fnName", line)` — pushed when a function is entered.
+ */
+function buildEnterScopeCall(
+  fnName: string,
+  line: number | null,
+): t.ExpressionStatement {
+  return t.expressionStatement(
+    t.callExpression(t.identifier("__enterScope"), [
+      t.stringLiteral(fnName),
+      line != null ? t.numericLiteral(line) : t.nullLiteral(),
+    ]),
+  );
+}
+
+/**
+ * Builds `__exitScope()` — popped on return or function end.
+ */
+function buildExitScopeCall(): t.ExpressionStatement {
+  return t.expressionStatement(
+    t.callExpression(t.identifier("__exitScope"), []),
+  );
+}
+
+/**
+ * Builds `__enterLoop()` — increments loop-depth counter.
+ */
+function buildEnterLoopCall(): t.ExpressionStatement {
+  return t.expressionStatement(
+    t.callExpression(t.identifier("__enterLoop"), []),
+  );
+}
+
+/**
+ * Builds `__exitLoop()` — decrements loop-depth counter.
+ * Wraps in a try/finally if we need guaranteed cleanup.
+ */
+function buildExitLoopCall(): t.ExpressionStatement {
+  return t.expressionStatement(
+    t.callExpression(t.identifier("__exitLoop"), []),
+  );
+}
+
+// ─── Insertion helpers ────────────────────────────────────────────────────────
+
+/**
+ * Inserts `statements` immediately *after* `path` in its parent block.
+ * Falls back to wrapping in a BlockStatement for bare single-statement
+ * branches (e.g. `if (x) doThis;`).
  */
 function insertAfter(
   path: NodePath<t.Statement>,
-  captureStmt: t.ExpressionStatement,
+  statements: t.ExpressionStatement[],
 ): void {
   if (path.parentPath?.isBlockStatement() || path.parentPath?.isProgram()) {
-    path.insertAfter(captureStmt);
+    // insertAfter inserts in reverse order when given multiple nodes
+    for (let i = statements.length - 1; i >= 0; i--) {
+      path.insertAfter(statements[i]);
+    }
     return;
   }
-
-  // For bare `if/else/for/while` single-statement bodies we need to wrap
-  const block = t.blockStatement([path.node, captureStmt]);
+  const block = t.blockStatement([path.node, ...statements]);
   path.replaceWith(block);
 }
 
 /**
- * Prepends a `__capture` statement at the **beginning** of a block body.
- * Used for loop-iteration capture (fires every iteration).
+ * Prepends `statements` at the **beginning** of a block body.
  */
 function prependToBlock(
   block: t.BlockStatement,
-  captureStmt: t.ExpressionStatement,
+  statements: t.ExpressionStatement[],
 ): void {
-  block.body.unshift(captureStmt);
+  block.body.unshift(...statements);
 }
 
 // ─── Visitor plugins ──────────────────────────────────────────────────────────
-//
-// Each plugin returns a partial Babel Visitor.  They are merged in buildVisitor.
 
 /**
- * Captures VariableDeclaration statements:
- *   `let x = 5;`  →  `let x = 5;\n__capture(n);`
+ * After every `let/const/var` declaration, emit:
+ *   `__trackVar("x", x); __capture(n);`
+ * for each declared binding.
  */
 function variableDeclarationPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureVariableDeclarations) return {};
 
   return {
     VariableDeclaration(path) {
-      // Skip variable declarations inside for-loop initialisers to avoid
-      // double-instrumentation (the loop plugin covers those bodies).
+      // Skip for-loop initialisers (the loop plugin handles those scopes)
       if (
         path.parentPath?.isForStatement() ||
         path.parentPath?.isForInStatement() ||
@@ -141,62 +185,83 @@ function variableDeclarationPlugin(ctx: TransformContext): Visitor {
         return;
       }
 
+      const trackCalls: t.ExpressionStatement[] = [];
+      for (const declarator of path.node.declarations) {
+        // Collect all bound names (handles destructuring patterns too)
+        const names = collectBindingNames(declarator.id);
+        for (const name of names) {
+          trackCalls.push(buildTrackVarCall(name));
+        }
+      }
+
       const capture = buildCaptureCall(
         ctx,
         "VariableDeclaration",
         path.node.loc,
       );
-      insertAfter(path as NodePath<t.Statement>, capture);
+      insertAfter(path as NodePath<t.Statement>, [...trackCalls, capture]);
     },
   };
 }
 
 /**
- * Captures assignment expressions that appear as standalone expression
- * statements:
- *   `x = 10;`  →  `x = 10;\n__capture(n);`
+ * After assignment expressions, emit:
+ *   `__trackVar("x", x); __capture(n);`
  */
 function assignmentPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureAssignments) return {};
 
   return {
     ExpressionStatement(path) {
-      if (!t.isAssignmentExpression(path.node.expression)) return;
+      const expr = path.node.expression;
+      if (!t.isAssignmentExpression(expr)) return;
+
+      const trackCalls: t.ExpressionStatement[] = [];
+      const names = collectLValueNames(expr.left);
+      for (const name of names) {
+        trackCalls.push(buildTrackVarCall(name));
+      }
 
       const capture = buildCaptureCall(
         ctx,
         "AssignmentExpression",
         path.node.loc,
       );
-      insertAfter(path as NodePath<t.Statement>, capture);
+      insertAfter(path as NodePath<t.Statement>, [...trackCalls, capture]);
     },
   };
 }
 
 /**
- * Captures update expressions used as standalone statements:
- *   `x++;`  →  `x++;\n__capture(n);`
+ * After update expressions (`x++`, `--y`), emit:
+ *   `__trackVar("x", x); __capture(n);`
  */
 function updateExpressionPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureAssignments) return {};
 
   return {
     ExpressionStatement(path) {
-      if (!t.isUpdateExpression(path.node.expression)) return;
+      const expr = path.node.expression;
+      if (!t.isUpdateExpression(expr)) return;
+
+      const trackCalls: t.ExpressionStatement[] = [];
+      if (t.isIdentifier(expr.argument)) {
+        trackCalls.push(buildTrackVarCall(expr.argument.name));
+      }
 
       const capture = buildCaptureCall(
         ctx,
         "UpdateExpression",
         path.node.loc,
       );
-      insertAfter(path as NodePath<t.Statement>, capture);
+      insertAfter(path as NodePath<t.Statement>, [...trackCalls, capture]);
     },
   };
 }
 
 /**
  * Captures generic expression statements not covered by the more specific
- * plugins above (i.e. not assignments, updates, or calls).
+ * plugins above (not assignments, updates, or calls).
  */
 function expressionStatementPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureExpressionStatements) return {};
@@ -204,8 +269,6 @@ function expressionStatementPlugin(ctx: TransformContext): Visitor {
   return {
     ExpressionStatement(path) {
       const expr = path.node.expression;
-
-      // Skip types already handled by more specific plugins
       if (
         t.isAssignmentExpression(expr) ||
         t.isUpdateExpression(expr) ||
@@ -214,20 +277,18 @@ function expressionStatementPlugin(ctx: TransformContext): Visitor {
       ) {
         return;
       }
-
       const capture = buildCaptureCall(
         ctx,
         "ExpressionStatement",
         path.node.loc,
       );
-      insertAfter(path as NodePath<t.Statement>, capture);
+      insertAfter(path as NodePath<t.Statement>, [capture]);
     },
   };
 }
 
 /**
- * Captures standalone function-call expression statements:
- *   `foo();`  →  `foo();\n__capture(n);`
+ * After standalone function-call statements, emit `__capture(n)`.
  */
 function functionCallPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureFunctionCalls) return {};
@@ -238,24 +299,32 @@ function functionCallPlugin(ctx: TransformContext): Visitor {
       if (!t.isCallExpression(expr) && !t.isOptionalCallExpression(expr)) {
         return;
       }
-
-      // Don't re-instrument our own injected __capture() calls
-      if (
-        t.isCallExpression(expr) &&
-        t.isIdentifier(expr.callee, { name: ctx.captureFnName })
-      ) {
-        return;
+      // Don't re-instrument our own injected runtime hooks
+      if (t.isCallExpression(expr) && t.isIdentifier(expr.callee)) {
+        const name = expr.callee.name;
+        if (
+          name === ctx.captureFnName ||
+          name === "__trackVar" ||
+          name === "__enterScope" ||
+          name === "__exitScope" ||
+          name === "__enterLoop" ||
+          name === "__exitLoop"
+        ) {
+          return;
+        }
       }
-
       const capture = buildCaptureCall(ctx, "CallExpression", path.node.loc);
-      insertAfter(path as NodePath<t.Statement>, capture);
+      insertAfter(path as NodePath<t.Statement>, [capture]);
     },
   };
 }
 
 /**
- * Captures return statements by inserting `__capture(n)` BEFORE the return
- * (the return exits the function so nothing after it would execute).
+ * Before every `return` statement, emit:
+ *   `__capture(n); __exitScope();`
+ *
+ * `__capture` is placed BEFORE the return (it exits immediately after).
+ * `__exitScope` pops the current function frame from the call stack.
  */
 function returnStatementPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureReturnStatements) return {};
@@ -263,6 +332,9 @@ function returnStatementPlugin(ctx: TransformContext): Visitor {
   return {
     ReturnStatement(path) {
       const capture = buildCaptureCall(ctx, "ReturnStatement", path.node.loc);
+      const exitScope = buildExitScopeCall();
+      // Insert in order: capture fires, then scope pops, then return executes
+      path.insertBefore(exitScope);
       path.insertBefore(capture);
       path.skip();
     },
@@ -270,9 +342,11 @@ function returnStatementPlugin(ctx: TransformContext): Visitor {
 }
 
 /**
- * Captures every loop iteration by prepending `__capture(n)` to loop bodies.
+ * For every loop (`for`, `for…in`, `for…of`, `while`, `do…while`):
  *
- * Covers: `for`, `for…in`, `for…of`, `while`, `do…while`.
+ * 1. Wrap the loop in a try/finally that calls `__enterLoop()` before
+ *    and `__exitLoop()` after (guaranteed even on `break`/`continue`).
+ * 2. Prepend `__capture(n)` to the loop body so it fires every iteration.
  */
 function loopIterationPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureLoopIterations) return {};
@@ -286,16 +360,28 @@ function loopIterationPlugin(ctx: TransformContext): Visitor {
       | t.DoWhileStatement
     >,
   ) => {
-    const bodyNode = path.node.body;
-
-    if (!t.isBlockStatement(bodyNode)) {
-      const block = t.blockStatement([bodyNode]);
-      path.node.body = block;
+    // ── Normalise body to a block ──────────────────────────────────────────
+    if (!t.isBlockStatement(path.node.body)) {
+      path.node.body = t.blockStatement([path.node.body]);
     }
-
     const block = path.node.body as t.BlockStatement;
-    const capture = buildCaptureCall(ctx, path.node.type, path.node.loc);
-    prependToBlock(block, capture);
+
+    // ── Prepend per-iteration capture ──────────────────────────────────────
+    const iterCapture = buildCaptureCall(ctx, path.node.type, path.node.loc);
+    prependToBlock(block, [iterCapture]);
+
+    // ── Wrap the whole loop in try/finally for __enterLoop/__exitLoop ──────
+    const enterLoop = buildEnterLoopCall();
+    const exitLoop = buildExitLoopCall();
+
+    const tryFinally = t.tryStatement(
+      t.blockStatement([path.node as t.Statement]),
+      null,
+      t.blockStatement([exitLoop]),
+    );
+
+    // Replace the loop with: __enterLoop(); try { <loop> } finally { __exitLoop(); }
+    path.replaceWithMultiple([enterLoop, tryFinally]);
   };
 
   return {
@@ -308,8 +394,7 @@ function loopIterationPlugin(ctx: TransformContext): Visitor {
 }
 
 /**
- * Captures inside `if` and `else` branches by appending `__capture(n)` at the
- * end of each branch body.
+ * Inside `if` / `else` branches, append `__capture(n)` at the end of each body.
  */
 function ifBlockPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureIfBlocks) return {};
@@ -319,32 +404,82 @@ function ifBlockPlugin(ctx: TransformContext): Visitor {
     nodeType: string,
     loc?: t.SourceLocation | null,
   ): t.Statement => {
+    const capture = buildCaptureCall(ctx, nodeType, loc);
     if (t.isBlockStatement(branch)) {
-      branch.body.push(buildCaptureCall(ctx, nodeType, loc));
+      branch.body.push(capture);
       return branch;
     }
-    // Wrap bare single-statement branch in a block
-    return t.blockStatement([branch, buildCaptureCall(ctx, nodeType, loc)]);
+    return t.blockStatement([branch, capture]);
   };
 
   return {
     IfStatement(path) {
       const node = path.node;
-
-      node.consequent = instrumentBranch(
-        node.consequent,
-        "IfConsequent",
-        node.loc,
-      );
-
+      node.consequent = instrumentBranch(node.consequent, "IfConsequent", node.loc);
       if (node.alternate && !t.isIfStatement(node.alternate)) {
-        node.alternate = instrumentBranch(
-          node.alternate,
-          "IfAlternate",
-          node.loc,
-        );
+        node.alternate = instrumentBranch(node.alternate, "IfAlternate", node.loc);
       }
     },
+  };
+}
+
+/**
+ * At the entry of every function declaration / expression / arrow function,
+ * prepend `__enterScope(name, line)`.
+ * At the end of the body (for functions without an explicit return that exits
+ * via `__exitScope` already), append `__exitScope()`.
+ */
+function functionScopePlugin(): Visitor {
+  const handleFunction = (
+    path: NodePath<
+      | t.FunctionDeclaration
+      | t.FunctionExpression
+      | t.ArrowFunctionExpression
+    >,
+  ) => {
+    const node = path.node;
+
+    // Resolve a display name for the frame
+    let fnName = "<anonymous>";
+    if (t.isFunctionDeclaration(node) && node.id) {
+      fnName = node.id.name;
+    } else if (
+      t.isFunctionExpression(node) &&
+      node.id
+    ) {
+      fnName = node.id.name;
+    } else if (path.parentPath?.isVariableDeclarator()) {
+      const id = (path.parentPath.node as t.VariableDeclarator).id;
+      if (t.isIdentifier(id)) fnName = id.name;
+    } else if (path.parentPath?.isAssignmentExpression()) {
+      const left = (path.parentPath.node as t.AssignmentExpression).left;
+      if (t.isIdentifier(left)) fnName = left.name;
+    } else if (path.parentPath?.isObjectProperty()) {
+      const key = (path.parentPath.node as t.ObjectProperty).key;
+      if (t.isIdentifier(key)) fnName = key.name;
+    }
+
+    const line = node.loc?.start.line ?? null;
+    const enterCall = buildEnterScopeCall(fnName, line);
+    const exitCall = buildExitScopeCall();
+
+    // Arrow functions can have an expression body — normalise to a block
+    if (t.isArrowFunctionExpression(node) && !t.isBlockStatement(node.body)) {
+      const returnStmt = t.returnStatement(node.body as t.Expression);
+      node.body = t.blockStatement([returnStmt]);
+    }
+
+    const body = node.body as t.BlockStatement;
+    // Prepend __enterScope
+    body.body.unshift(enterCall);
+    // Append __exitScope (handles the implicit-return / fall-through case)
+    body.body.push(exitCall);
+  };
+
+  return {
+    FunctionDeclaration: handleFunction,
+    FunctionExpression: handleFunction,
+    ArrowFunctionExpression: handleFunction,
   };
 }
 
@@ -352,6 +487,9 @@ function ifBlockPlugin(ctx: TransformContext): Visitor {
 
 function buildVisitor(ctx: TransformContext): Visitor {
   const plugins: Visitor[] = [
+    // functionScopePlugin must run first so it wraps all function bodies
+    // before other plugins insert statements inside them.
+    functionScopePlugin(),
     loopIterationPlugin(ctx),
     ifBlockPlugin(ctx),
     returnStatementPlugin(ctx),
@@ -362,13 +500,58 @@ function buildVisitor(ctx: TransformContext): Visitor {
     expressionStatementPlugin(ctx),
   ];
 
-  // Use Babel's built-in visitor merge if available, otherwise plain merge
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const mergeVisitors = (traverse as any).visitors?.merge as
     | ((visitors: Visitor[]) => Visitor)
     | undefined;
 
   return mergeVisitors ? mergeVisitors(plugins) : Object.assign({}, ...plugins);
+}
+
+// ─── Binding name helpers ─────────────────────────────────────────────────────
+
+/**
+ * Recursively collects all identifier names from an LVal (assignment target).
+ * Handles simple identifiers, array patterns, and object patterns.
+ */
+function collectBindingNames(node: t.LVal | t.Expression): string[] {
+  if (t.isIdentifier(node)) return [node.name];
+  if (t.isArrayPattern(node)) {
+    return node.elements.flatMap((el) =>
+      el && !t.isRestElement(el) ? collectBindingNames(el as t.LVal) : [],
+    );
+  }
+  if (t.isObjectPattern(node)) {
+    return node.properties.flatMap((prop) => {
+      if (t.isRestElement(prop)) {
+        return t.isIdentifier(prop.argument) ? [prop.argument.name] : [];
+      }
+      return collectBindingNames((prop as t.ObjectProperty).value as t.LVal);
+    });
+  }
+  if (t.isAssignmentPattern(node)) {
+    return collectBindingNames(node.left);
+  }
+  return [];
+}
+
+/**
+ * Collects names from the left-hand side of an assignment expression.
+ */
+function collectLValueNames(node: t.LVal | t.Expression): string[] {
+  if (t.isIdentifier(node)) return [node.name];
+  if (t.isMemberExpression(node)) {
+    // `obj.prop = …` or `arr[i] = …` — track the root object
+    const root = getMemberRoot(node);
+    return root ? [root] : [];
+  }
+  return collectBindingNames(node as t.LVal);
+}
+
+function getMemberRoot(node: t.MemberExpression): string | null {
+  if (t.isIdentifier(node.object)) return node.object.name;
+  if (t.isMemberExpression(node.object)) return getMemberRoot(node.object);
+  return null;
 }
 
 // ─── Error normalisation ───────────────────────────────────────────────────────
@@ -388,22 +571,28 @@ function toParseError(thrown: unknown): ParseError {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Transforms `code` by injecting `__capture(step)` calls at every configured
- * statement site and returns the instrumented JavaScript together with a v3
- * source map.
+ * Transforms `code` by injecting snapshot-recorder instrumentation and returns
+ * the instrumented JavaScript together with a v3 source map.
  *
- * @param code    - Raw JavaScript / TypeScript source accepted by the parser.
- * @param options - Optional per-site feature flags and capture-function name.
+ * The transformed output will call these runtime hooks (provided by the worker):
+ *   - `__capture(step)`           – snapshot trigger
+ *   - `__trackVar(name, value)`   – variable tracker
+ *   - `__enterScope(name, line)`  – call-stack push
+ *   - `__exitScope()`             – call-stack pop
+ *   - `__enterLoop()`             – loop-depth increment
+ *   - `__exitLoop()`              – loop-depth decrement
  *
  * @example
  * ```ts
  * const result = transformCode('let x = 5;\nx++;');
  * if (result.success) {
  *   console.log(result.transformedCode);
+ *   // __enterScope("<global>", 1);
  *   // let x = 5;
- *   // __capture(1);
+ *   // __trackVar("x", x); __capture(1);
  *   // x++;
- *   // __capture(2);
+ *   // __trackVar("x", x); __capture(2);
+ *   // __exitScope();
  * }
  * ```
  */
