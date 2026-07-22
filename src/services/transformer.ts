@@ -351,6 +351,12 @@ function returnStatementPlugin(ctx: TransformContext): Visitor {
 function loopIterationPlugin(ctx: TransformContext): Visitor {
   if (!ctx.opts.captureLoopIterations) return {};
 
+  // WeakSet tracks loop nodes that have already been instrumented.
+  // This is the canonical Babel pattern for preventing re-entry when
+  // replaceWithMultiple() causes the visitor to fire again on the same node
+  // (which is now inside the try-block of the replacement).
+  const visited = new WeakSet<t.Node>();
+
   const handleLoop = (
     path: NodePath<
       | t.ForStatement
@@ -360,6 +366,10 @@ function loopIterationPlugin(ctx: TransformContext): Visitor {
       | t.DoWhileStatement
     >,
   ) => {
+    // Guard: skip if this exact node was already instrumented
+    if (visited.has(path.node)) return;
+    visited.add(path.node);
+
     // ── Normalise body to a block ──────────────────────────────────────────
     if (!t.isBlockStatement(path.node.body)) {
       path.node.body = t.blockStatement([path.node.body]);
@@ -380,7 +390,7 @@ function loopIterationPlugin(ctx: TransformContext): Visitor {
       t.blockStatement([exitLoop]),
     );
 
-    // Replace the loop with: __enterLoop(); try { <loop> } finally { __exitLoop(); }
+    // Replace: __enterLoop(); try { <loop> } finally { __exitLoop(); }
     path.replaceWithMultiple([enterLoop, tryFinally]);
   };
 
@@ -481,7 +491,7 @@ function functionScopePlugin(): Visitor {
     FunctionExpression: handleFunction,
     ArrowFunctionExpression: handleFunction,
   };
-}
+} 
 
 // ─── Visitor composition ──────────────────────────────────────────────────────
 

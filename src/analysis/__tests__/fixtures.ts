@@ -13,13 +13,15 @@ import type { ExecutionSnapshot, HeapEntry, StackFrame } from "../../types";
  * Creates a minimal `ExecutionSnapshot` with sensible defaults.
  * Only `variables` and `heap` need to be specified for most tests.
  */
+let _nextSnapshotId = 1;
+
 export function makeSnapshot(
   variables: Record<string, unknown>,
   heap: Record<string, HeapEntry> = {},
   overrides: Partial<ExecutionSnapshot> = {},
 ): ExecutionSnapshot {
   return {
-    id: 1,
+    id: _nextSnapshotId++,
     line: 1,
     variables,
     heap,
@@ -150,11 +152,13 @@ export const undirectedGraphSnapshot = makeSnapshot(
     "@h1": {
       id: "@h1",
       kind: "object",
-      value: { "0": "@h2", "1": "@h3", "3": "@h4" },
+      // All four nodes listed so every edge u→v has a reverse v→u (undirected)
+      value: { "0": "@h2", "1": "@h3", "2": "@h5", "3": "@h4" },
     },
-    "@h2": { id: "@h2", kind: "array", value: [1, 2] },
-    "@h3": { id: "@h3", kind: "array", value: [0, 3] },
-    "@h4": { id: "@h4", kind: "array", value: [1] },
+    "@h2": { id: "@h2", kind: "array", value: [1, 2] },  // 0 → [1, 2]
+    "@h3": { id: "@h3", kind: "array", value: [0, 3] },  // 1 → [0, 3]
+    "@h4": { id: "@h4", kind: "array", value: [1] },     // 3 → [1]
+    "@h5": { id: "@h5", kind: "array", value: [0] },     // 2 → [0]  ← reverse of 0→2
   },
 );
 
