@@ -1,49 +1,14 @@
 import React from 'react';
 import { Play, StepForward, RotateCcw } from 'lucide-react';
 import { useAppDispatch, useAppSelector } from '../../hooks/storeHooks';
-import {
-  setIsRunning,
-  resetCode,
-  setAst,
-  appendLog,
-  clearConsoleLogs,
-  clearAst,
-} from '../../store/editorSlice';
-import { parseCode } from '../../services/parser';
+import { resetCode } from '../../store/editorSlice';
+import { useRunCode } from '../../hooks/useRunCode';
+import { usePlayback } from '../../hooks/usePlayback';
 
 const TopToolbar: React.FC = () => {
   const dispatch = useAppDispatch();
-  const { isRunning, code } = useAppSelector((state) => state.editor);
-
-  const handleRun = () => {
-    // Clear previous state before re-parsing.
-    dispatch(clearConsoleLogs());
-    dispatch(clearAst());
-    dispatch(setIsRunning(true));
-
-    dispatch(appendLog({ level: 'info', message: 'Parsing code…' }));
-
-    const result = parseCode(code);
-
-    if (result.success) {
-      dispatch(setAst(result.ast));
-      dispatch(setIsRunning(false));
-    } else {
-      const { message, line, column } = result.error;
-      const location =
-        line != null
-          ? ` (line ${line}${column != null ? `, col ${column}` : ''})`
-          : '';
-
-      dispatch(
-        appendLog({
-          level: 'error',
-          message: `SyntaxError${location}: ${message}`,
-        }),
-      );
-      dispatch(setIsRunning(false));
-    }
-  };
+  const { runCode, isRunning } = useRunCode();
+  const { initialized, next, isAtEnd } = usePlayback();
 
   const handleReset = () => {
     dispatch(resetCode());
@@ -56,9 +21,10 @@ const TopToolbar: React.FC = () => {
       </div>
 
       <div className="flex items-center space-x-2">
+        {/* Run — triggers the full transform → execute → record pipeline */}
         <button
           id="btn-run"
-          onClick={handleRun}
+          onClick={runCode}
           disabled={isRunning}
           className={`flex items-center px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
             isRunning
@@ -67,14 +33,16 @@ const TopToolbar: React.FC = () => {
           }`}
         >
           <Play size={16} className="mr-1.5" />
-          Run
+          {isRunning ? 'Running…' : 'Run'}
         </button>
 
+        {/* Step — advances playback one snapshot forward */}
         <button
           id="btn-step"
-          disabled={!isRunning}
+          onClick={next}
+          disabled={!initialized || isAtEnd}
           className={`flex items-center px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-            !isRunning
+            !initialized || isAtEnd
               ? 'bg-muted text-muted-foreground cursor-not-allowed'
               : 'bg-blue-600/20 text-blue-500 hover:bg-blue-600/30'
           }`}
@@ -85,6 +53,7 @@ const TopToolbar: React.FC = () => {
 
         <div className="w-px h-5 bg-border mx-1" />
 
+        {/* Reset — clears code, playback, and console */}
         <button
           id="btn-reset"
           onClick={handleReset}

@@ -40,7 +40,7 @@ import {
 } from "../store/playback/selectors";
 import { loadSnapshots, clear } from "../store/playback/actions";
 import type { ExecutionSnapshot } from "../types";
-import type { PlaybackContext } from "./PlaybackContext";
+import type { PlaybackContext } from "../playback/PlaybackContext";
 
 // ─── Return type ──────────────────────────────────────────────────────────────
 

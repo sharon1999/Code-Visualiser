@@ -67,16 +67,17 @@ const SingleLinkedList = React.memo(function SingleLinkedList({
             const isHead = i === 0;
             const isTail = i === ll.nodes.length - 1;
             return (
-              <React.Fragment key={node.heapRef}>
+              // Wrap node + arrow in a keyed flex container.
+              // AnimatePresence requires the key on the outermost element;
+              // React.Fragment no longer accepts key as a prop in React 19.
+              <div key={node.heapRef} className="flex items-center gap-1">
                 <motion.div
                   layout
                   initial={{ opacity: 0, scale: 0.8 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.8 }}
                   transition={{ type: "spring", stiffness: 500, damping: 35 }}
-                  className={`
-                    relative flex flex-col items-center
-                  `}
+                  className="relative flex flex-col items-center"
                 >
                   {/* Position label */}
                   {(isHead || isTail) && (
@@ -109,7 +110,7 @@ const SingleLinkedList = React.memo(function SingleLinkedList({
 
                 {/* Arrow between nodes */}
                 {i < ll.nodes.length - 1 && <Arrow />}
-              </React.Fragment>
+              </div>
             );
           })}
         </AnimatePresence>
